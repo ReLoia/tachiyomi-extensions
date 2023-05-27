@@ -123,8 +123,14 @@ class ShingekiNoShoujo : ParsedHttpSource() {
                     setUrlWithoutDomain(it.attr("href"))
                     it.text().let { n ->
                         name = n
-                        chapter_number = n.replace(Regex("OneShot|Prologo"), "0").filter { t -> t.isDigit() }.let { t ->
-                            t.ifEmpty { "$i" }
+                        chapter_number = n.replace(Regex("OneShot|Prologo"), "0").replace("Capitolo", "").let {
+                            if (!it.contains(Regex("[0-9]\\."))) {
+                                it.filter { t -> t.isDigit() }.let { t ->
+                                    t.ifEmpty { "$i" }
+                                }
+                            } else {
+                                it
+                            }
                         }.toFloat()
                     }
                 },
@@ -140,7 +146,7 @@ class ShingekiNoShoujo : ParsedHttpSource() {
     override fun pageListParse(document: Document): List<Page> {
         val pages = mutableListOf<Page>()
 
-        document.select("article > .entry-content .alignnone").forEachIndexed { i, it ->
+        document.select("article > .entry-content img").forEachIndexed { i, it ->
             pages.add(Page(i, "", it.attr("src")))
         }
         if (document.toString().contains("che state leggendo")) {
