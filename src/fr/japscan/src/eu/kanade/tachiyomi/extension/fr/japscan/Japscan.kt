@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import eu.kanade.tachiyomi.lib.synchrony.Deobfuscator
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -68,7 +69,7 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
     }
 
     private fun chapterListPref() = preferences.getString(SHOW_SPOILER_CHAPTERS, "hide")
-    
+
     override fun headersBuilder() = super.headersBuilder()
         .add("referer", "$baseUrl/")
 
@@ -266,20 +267,13 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
     private val sortedLookupString: List<Char> = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".toCharArray().toList()
 
     override fun pageListParse(document: Document): List<Page> {
-        /*
-            JapScan stores chapter metadata in a `#data` element, and in the `data-data` attribute.
-
-            This data is scrambled base64, and to unscramble it this code searches in the ZJS for
-            two strings of length 62 (base64 minus `+` and `/`), creating a character map.
-
-            Since figuring out how to properly map characters would be more effort than I want to
-            put in, this just flips around the charsets if the first attempt didn't succeed.
-         */
         val zjsurl = document.getElementsByTag("script").first {
             it.attr("src").contains("zjs", ignoreCase = true)
         }.attr("src")
         Log.d("japscan", "ZJS at $zjsurl")
-        val zjs = client.newCall(GET(baseUrl + zjsurl, headers)).execute().body.string()
+
+        val obfuscatedZjs = client.newCall(GET(baseUrl + zjsurl, headers)).execute().body.string()
+        val zjs = Deobfuscator.deobfuscateScript(obfuscatedZjs) ?: throw Exception("Impossible à désobfusquer ZJS")
 
         val stringLookupTables = decodingStringsRe.findAll(zjs).mapNotNull {
             it.groupValues[1].takeIf {
@@ -290,7 +284,6 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
         if (stringLookupTables.size != 2) {
             throw Exception("Attendait 2 chaînes de recherche dans ZJS, a trouvé ${stringLookupTables.size}")
         }
-        Log.d("japscan", "lookup tables: $stringLookupTables")
 
         val scrambledData = document.getElementById("data")!!.attr("data-data")
 

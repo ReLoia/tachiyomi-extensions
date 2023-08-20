@@ -5,62 +5,63 @@ import android.content.SharedPreferences
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.extension.en.allanime.AllAnimeHelper.buildApiHeaders
+import eu.kanade.tachiyomi.extension.en.allanime.AllAnimeHelper.firstInstanceOrNull
+import eu.kanade.tachiyomi.extension.en.allanime.AllAnimeHelper.parseAs
+import eu.kanade.tachiyomi.extension.en.allanime.AllAnimeHelper.toJsonRequestBody
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
+import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_EXCLUDE
-import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_INCLUDE
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonObject
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
+import kotlinx.serialization.json.float
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.jsoup.Jsoup
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
-import uy.kohesive.injekt.injectLazy
-import java.util.Locale
 
 class AllAnime : ConfigurableSource, HttpSource() {
 
     override val name = "AllAnime"
 
+    override val baseUrl = "https://allanime.ai"
+
+    private val apiUrl = "https://api.allanime.day/api"
+
     override val lang = "en"
 
     override val supportsLatest = true
 
-    private val json: Json by injectLazy()
-
-    private val preferences: SharedPreferences =
+    private val preferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    }
 
-    private val domain = preferences.getString(DOMAIN_PREF, "allanime.to")
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val frag = request.url.fragment
+            val quality = preferences.imageQuality
 
-    override val baseUrl = "https://$domain"
+            if (frag.isNullOrEmpty() || quality == IMAGE_QUALITY_PREF_DEFAULT) {
+                return@addInterceptor chain.proceed(request)
+            }
 
-    private val apiUrl = "https://api.$domain/allanimeapi"
+            val oldUrl = request.url.toString()
+            val newUrl = oldUrl.replace(imageQualityRegex, "$image_cdn/$1?w=$quality")
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .rateLimitHost(apiUrl.toHttpUrl(), 1)
+            return@addInterceptor chain.proceed(
+                request.newBuilder()
+                    .url(newUrl)
+                    .build(),
+            )
+        }
+        .rateLimit(1)
         .build()
 
     override fun headersBuilder() = super.headersBuilder()
@@ -68,33 +69,34 @@ class AllAnime : ConfigurableSource, HttpSource() {
 
     /* Popular */
     override fun popularMangaRequest(page: Int): Request {
-        val showAdult = preferences.getBoolean(SHOW_ADULT_PREF, false)
+        val payload = GraphQL(
+            PopularVariables(
+                type = "manga",
+                size = limit,
+                dateRange = 0,
+                page = page,
+                allowAdult = preferences.allowAdult,
+                allowUnknown = false,
+            ),
+            POPULAR_QUERY,
+        )
 
-        val payload = buildJsonObject {
-            putJsonObject("variables") {
-                put("type", "manga")
-                put("size", limit)
-                put("dateRange", 0)
-                put("page", page)
-                put("allowAdult", showAdult)
-                put("allowUnknown", false)
-            }
-            put("query", POPULAR_QUERY)
-        }
+        val requestBody = payload.toJsonRequestBody()
 
-        return apiRequest(payload)
+        val apiHeaders = headersBuilder().buildApiHeaders(requestBody)
+
+        return POST(apiUrl, apiHeaders, requestBody)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val result = json.decodeFromString<ApiPopularResponse>(response.body.string())
+        val result = response.parseAs<ApiPopularResponse>()
 
-        val mangaList = result.data.queryPopular.recommendations
-            .mapNotNull { it.anyCard }
-            .map { manga ->
-                toSManga(manga)
-            }
+        val mangaList = result.data.popular.mangas
+            .mapNotNull { it.manga?.toSManga() }
 
-        return MangasPage(mangaList, mangaList.size == limit)
+        val hasNextPage = result.data.popular.mangas.size == limit
+
+        return MangasPage(mangaList, hasNextPage)
     }
 
     /* Latest */
@@ -115,83 +117,65 @@ class AllAnime : ConfigurableSource, HttpSource() {
     }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val showAdult = preferences.getBoolean(SHOW_ADULT_PREF, false)
-        var country = "ALL"
-        val includeGenres = mutableListOf<String>()
-        val excludeGenres = mutableListOf<String>()
+        val payload = GraphQL(
+            SearchVariables(
+                search = SearchPayload(
+                    query = query.takeUnless { it.isEmpty() },
+                    sortBy = filters.firstInstanceOrNull<SortFilter>()?.getValue(),
+                    genres = filters.firstInstanceOrNull<GenreFilter>()?.included,
+                    excludeGenres = filters.firstInstanceOrNull<GenreFilter>()?.excluded,
+                    isManga = true,
+                    allowAdult = preferences.allowAdult,
+                    allowUnknown = false,
+                ),
+                size = limit,
+                page = page,
+                translationType = "sub",
+                countryOrigin = filters.firstInstanceOrNull<CountryFilter>()?.getValue() ?: "ALL",
+            ),
+            SEARCH_QUERY,
+        )
 
-        filters.forEach { filter ->
-            when (filter) {
-                is GenreFilter -> {
-                    filter.state.forEach { genreState ->
-                        when (genreState.state) {
-                            STATE_INCLUDE -> includeGenres.add(genreState.name)
-                            STATE_EXCLUDE -> excludeGenres.add(genreState.name)
-                        }
-                    }
-                }
-                is CountryFilter -> {
-                    country = filter.getValue()
-                }
-                else -> {}
-            }
-        }
+        val requestBody = payload.toJsonRequestBody()
 
-        val payload = buildJsonObject {
-            putJsonObject("variables") {
-                putJsonObject("search") {
-                    if (includeGenres.isNotEmpty() || excludeGenres.isNotEmpty()) {
-                        put("genres", JsonArray(includeGenres.map { JsonPrimitive(it) }))
-                        put("excludeGenres", JsonArray(excludeGenres.map { JsonPrimitive(it) }))
-                    }
-                    if (query.isNotEmpty()) put("query", query)
-                    put("allowAdult", showAdult)
-                    put("allowUnknown", false)
-                    put("isManga", true)
-                }
-                put("limit", limit)
-                put("page", page)
-                put("translationType", "sub")
-                put("countryOrigin", country)
-            }
-            put("query", SEARCH_QUERY)
-        }
+        val apiHeaders = headersBuilder().buildApiHeaders(requestBody)
 
-        return apiRequest(payload)
+        return POST(apiUrl, apiHeaders, requestBody)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val result = json.decodeFromString<ApiSearchResponse>(response.body.string())
+        val result = response.parseAs<ApiSearchResponse>()
 
         val mangaList = result.data.mangas.edges
-            .map { manga ->
-                toSManga(manga)
-            }
+            .map(SearchManga::toSManga)
 
-        return MangasPage(mangaList, mangaList.size == limit)
+        val hasNextPage = result.data.mangas.edges.size == limit
+
+        return MangasPage(mangaList, hasNextPage)
     }
 
-    override fun getFilterList() = filters
+    override fun getFilterList() = getFilters()
 
     /* Details */
     override fun mangaDetailsRequest(manga: SManga): Request {
         val mangaId = manga.url.split("/")[2]
 
-        val payload = buildJsonObject {
-            putJsonObject("variables") {
-                put("_id", mangaId)
-            }
-            put("query", DETAILS_QUERY)
-        }
+        val payload = GraphQL(
+            IDVariables(mangaId),
+            DETAILS_QUERY,
+        )
 
-        return apiRequest(payload)
+        val requestBody = payload.toJsonRequestBody()
+
+        val apiHeaders = headersBuilder().buildApiHeaders(requestBody)
+
+        return POST(apiUrl, apiHeaders, requestBody)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val result = json.decodeFromString<ApiMangaDetailsResponse>(response.body.string())
-        val manga = result.data.manga
+        val result = response.parseAs<ApiMangaDetailsResponse>()
 
-        return toSManga(manga)
+        return result.data.manga.toSManga()
     }
 
     override fun getMangaUrl(manga: SManga): String {
@@ -210,29 +194,31 @@ class AllAnime : ConfigurableSource, HttpSource() {
     override fun chapterListRequest(manga: SManga): Request {
         val mangaId = manga.url.split("/")[2]
 
-        val payload = buildJsonObject {
-            putJsonObject("variables") {
-                put("_id", mangaId)
-            }
-            put("query", CHAPTERS_QUERY)
-        }
+        val payload = GraphQL(
+            ChapterListVariables(
+                id = "manga@$mangaId",
+                chapterNumStart = 0f,
+                chapterNumEnd = 9999f,
+            ),
+            CHAPTERS_QUERY,
+        )
 
-        return apiRequest(payload)
+        val requestBody = payload.toJsonRequestBody()
+
+        val apiHeaders = headersBuilder().buildApiHeaders(requestBody)
+
+        return POST(apiUrl, apiHeaders, requestBody)
     }
 
     private fun chapterListParse(response: Response, manga: SManga): List<SChapter> {
-        val result = json.decodeFromString<ApiChapterListResponse>(response.body.string())
+        val result = response.parseAs<ApiChapterListResponse>()
 
-        val chapters = result.data.manga.availableChaptersDetail.sub
+        val chapters = result.data.chapterList?.sortedByDescending { it.chapterNum.float }
+            ?: return emptyList()
 
         val mangaUrl = manga.url.substringAfter("/manga/")
 
-        return chapters?.map { chapter ->
-            SChapter.create().apply {
-                name = "Chapter $chapter"
-                url = "/read/$mangaUrl/chapter-$chapter-sub"
-            }
-        } ?: emptyList()
+        return chapters.map { it.toSChapter(mangaUrl) }
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -244,177 +230,84 @@ class AllAnime : ConfigurableSource, HttpSource() {
     }
 
     /* Pages */
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return client.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map { response ->
-                pageListParse(response, chapter)
-            }
-    }
-
     override fun pageListRequest(chapter: SChapter): Request {
         val chapterUrl = chapter.url.split("/")
         val mangaId = chapterUrl[2]
         val chapterNo = chapterUrl[4].split("-")[1]
 
-        val payload = buildJsonObject {
-            putJsonObject("variables") {
-                put("mangaId", mangaId)
-                put("translationType", "sub")
-                put("chapterString", chapterNo)
-            }
-            put("query", PAGE_QUERY)
-        }
+        val payload = GraphQL(
+            PageListVariables(
+                id = mangaId,
+                chapterNum = chapterNo,
+                translationType = "sub",
+            ),
+            PAGE_QUERY,
+        )
 
-        return apiRequest(payload)
-    }
+        val requestBody = payload.toJsonRequestBody()
 
-    private fun pageListParse(response: Response, chapter: SChapter): List<Page> {
-        val result = json.decodeFromString<ApiPageListResponse>(response.body.string())
-        val pages = result.data.chapterPages?.edges?.get(0) ?: return emptyList()
+        val apiHeaders = headersBuilder().buildApiHeaders(requestBody)
 
-        val imageDomain = if (!pages.pictureUrlHead.isNullOrEmpty()) {
-            pages.pictureUrlHead.let { server ->
-                if (server.matches(urlRegex)) {
-                    server
-                } else {
-                    "https://$server"
-                }
-            }
-        } else {
-            // in rare cases, the api doesn't return server url
-            // for that, we try to parse the frontend html to get it
-            val chapterUrl = getChapterUrl(chapter)
-            val frontendRequest = GET(chapterUrl, headers)
-            val url = client.newCall(frontendRequest).execute().use { frontendResponse ->
-                val document = frontendResponse.asJsoup()
-                val script = document.select("script:containsData(window.__NUXT__)").firstOrNull()
-                imageUrlFromPageRegex.matchEntire(script.toString())
-                    ?.groupValues
-                    ?.getOrNull(1)
-                    ?.replace("\\u002F", "/")
-                    ?.substringBeforeLast(pages.pictureUrls.first().toString(), "")
-            }
-            url?.takeIf { it.isNotEmpty() } ?: return emptyList()
-        }
-
-        return pages.pictureUrls.mapIndexed { index, image ->
-            Page(
-                index = index,
-                imageUrl = "$imageDomain${image.url}",
-            )
-        }
+        return POST(apiUrl, apiHeaders, requestBody)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        throw UnsupportedOperationException("Not used")
+        val result = response.parseAs<ApiPageListResponse>()
+        val pages = result.data.pageList?.edges?.get(0) ?: return emptyList()
+
+        val imageDomain = pages.serverUrl?.let { server ->
+            if (server.matches(urlRegex)) {
+                server
+            } else {
+                "https://$server"
+            }
+        } ?: return emptyList()
+
+        return pages.pictureUrls?.mapIndexed { index, image ->
+            Page(
+                index = index,
+                imageUrl = "$imageDomain${image.url}#page",
+            )
+        } ?: emptyList()
     }
 
     override fun imageUrlParse(response: Response): String {
         throw UnsupportedOperationException("Not used")
     }
 
-    /* Helpers */
-    private fun apiRequest(payload: JsonObject): Request {
-        val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
-
-        val newHeaders = headersBuilder()
-            .add("Content-Length", body.contentLength().toString())
-            .add("Content-Type", body.contentType().toString())
-            .build()
-
-        return POST(apiUrl, newHeaders, body)
-    }
-
-    private fun toSManga(manga: Manga): SManga {
-        val titleStyle = preferences.getString(TITLE_PREF, "romaji")!!
-
-        return SManga.create().apply {
-            title = when (titleStyle) {
-                "romaji" -> manga.name
-                "eng" -> manga.englishName ?: manga.name
-                else -> manga.nativeName ?: manga.name
-            }
-            url = "/manga/${manga._id}/${manga.name.titleToSlug()}"
-            thumbnail_url = manga.thumbnail.parseThumbnailUrl()
-            description = Jsoup.parse(
-                manga.description?.replace("<br>", "br2n") ?: "",
-            ).text().replace("br2n", "\n")
-            description += if (manga.altNames != null) {
-                "\n\nAlternative Names: ${manga.altNames.joinToString { it.trim() }}"
-            } else {
-                ""
-            }
-            if (manga.authors?.isNotEmpty() == true) {
-                author = manga.authors.first().trim()
-                artist = author
-            }
-            genre = "${manga.genres?.joinToString { it.trim() }}, ${manga.tags?.joinToString { it.trim() }}"
-            status = manga.status.parseStatus()
-        }
-    }
-
-    private fun String.parseThumbnailUrl(): String {
-        return if (this.matches(urlRegex)) {
-            this
-        } else {
-            "$image_cdn$this?w=250"
-        }
-    }
-
-    private fun String?.parseStatus(): Int {
-        if (this == null) {
-            return SManga.UNKNOWN
-        }
-
-        return when {
-            this.contains("releasing", true) -> SManga.ONGOING
-            this.contains("finished", true) -> SManga.COMPLETED
-            else -> SManga.UNKNOWN
-        }
-    }
-
-    private fun String.titleToSlug() = this.trim()
-        .lowercase(Locale.US)
-        .replace(titleSpecialCharactersRegex, "-")
-
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
-            key = DOMAIN_PREF
-            title = "Preferred domain"
-            entries = arrayOf("allanime.to", "allanime.co")
-            entryValues = arrayOf("allanime.to", "allanime.co")
-            setDefaultValue("allanime.to")
-            summary = "Requires App Restart"
-        }.let { screen.addPreference(it) }
-
-        ListPreference(screen.context).apply {
-            key = TITLE_PREF
-            title = "Preferred Title Style"
-            entries = arrayOf("Romaji", "English", "Native")
-            entryValues = arrayOf("romaji", "eng", "native")
-            setDefaultValue("romaji")
-            summary = "%s"
-        }.let { screen.addPreference(it) }
+            key = IMAGE_QUALITY_PREF
+            title = "Image Quality"
+            entries = arrayOf("Original", "Wp-800", "Wp-480")
+            entryValues = arrayOf("original", "800", "480")
+            setDefaultValue(IMAGE_QUALITY_PREF_DEFAULT)
+            summary = "Warning: Wp quality servers can be slow and might not work sometimes"
+        }.also(screen::addPreference)
 
         SwitchPreferenceCompat(screen.context).apply {
             key = SHOW_ADULT_PREF
             title = "Show Adult Content"
-            setDefaultValue(false)
-        }.let { screen.addPreference(it) }
+            setDefaultValue(SHOW_ADULT_PREF_DEFAULT)
+        }.also(screen::addPreference)
     }
 
-    companion object {
-        private const val limit = 26
-        const val SEARCH_PREFIX = "id:"
-        private const val image_cdn = "https://wp.youtube-anime.com/aln.youtube-anime.com/"
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
-        private val urlRegex = Regex("^https?://.*")
-        private val titleSpecialCharactersRegex = Regex("[^a-z\\d]+")
-        private val imageUrlFromPageRegex = Regex("selectedPicturesServer:\\[\\{.*?url:\"(.*?)\".*?\\}\\]")
+    private val SharedPreferences.allowAdult
+        get() = getBoolean(SHOW_ADULT_PREF, SHOW_ADULT_PREF_DEFAULT)
 
-        private const val DOMAIN_PREF = "pref_domain"
-        private const val TITLE_PREF = "pref_title"
+    private val SharedPreferences.imageQuality
+        get() = getString(IMAGE_QUALITY_PREF, IMAGE_QUALITY_PREF_DEFAULT)!!
+
+    companion object {
+        private const val limit = 20
+        const val SEARCH_PREFIX = "id:"
+        val urlRegex = Regex("^https?://.*")
+        private const val image_cdn = "https://wp.youtube-anime.com"
+        private val imageQualityRegex = Regex("^https?://(.*)#.*")
+
         private const val SHOW_ADULT_PREF = "pref_adult"
+        private const val SHOW_ADULT_PREF_DEFAULT = false
+        private const val IMAGE_QUALITY_PREF = "pref_quality"
+        private const val IMAGE_QUALITY_PREF_DEFAULT = "original"
     }
 }
